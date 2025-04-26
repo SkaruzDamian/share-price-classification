@@ -1,3 +1,4 @@
+
 import pandas as pd
 import numpy as np
 from sklearn import preprocessing
@@ -31,19 +32,17 @@ class ConfigReader:
         return config
 
     def get_parameters(self):
-        weeks = self.config.get('weeks', 20) 
-        history = self.config.get('history', 100) 
+        weeks = 20  
         features = [f for f in self.config['features'] if not f.startswith('#')]
-        random_state = self.config.get('random_state', 42)
+        k = self.config['k']
+        history = 100  
+        random_state = self.config.get('random_state', 1)
         if random_state == 0:
             random_state = int(time.time())
         algorithm = self.config['algorithm']
         initial_capital = self.config.get('initial_capital', 50000)
-        
-        split_date = self.config.get('split_date', '2015-01-05')
-        split_date_exit = self.config.get('split_date_exit', '2020-01-02')
-        
-        return weeks, features, history, random_state, algorithm, initial_capital, split_date, split_date_exit, self.config
+        sell_threshold = self.config.get('sell_threshold', 1.10)
+        return weeks, features, k, history, random_state, algorithm, initial_capital, sell_threshold, self.config
 
 class ClassifierFactory:
     def __init__(self, config):
@@ -54,10 +53,59 @@ class ClassifierFactory:
         params = {k: v for k, v in self.config[algorithm].items() if not k.startswith('#')}
         random_state = params.pop('random_state', self.config.get('random_state'))
 
-        if algorithm == "Nearest Neighbors":
+        if algorithm == "AdaBoost":
+            estimator_name = params.pop('estimator', None)
+            if estimator_name:
+                base_estimator = self._get_base_estimator(estimator_name)
+                return AdaBoostClassifier(estimator=base_estimator, **params, random_state=random_state)
+            return AdaBoostClassifier(**params, random_state=random_state)
+        elif algorithm == "Nearest Neighbors":
             return KNeighborsClassifier(**params)
+        elif algorithm == "Linear SVM":
+            return SVC(**params, random_state=random_state)
+        elif algorithm == "Gaussian Process":
+            kernel_scale = params.pop('kernel_scale', 1.0)
+            return GaussianProcessClassifier(1.0 * RBF(kernel_scale), random_state=random_state)
+        elif algorithm == "Decision Tree":
+            return DecisionTreeClassifier(**params, random_state=random_state)
+        elif algorithm == "Random Forest":
+            return RandomForestClassifier(**params, random_state=random_state)
+        elif algorithm == "Neural Net":
+            return MLPClassifier(**params, random_state=random_state)
+        elif algorithm == "Naive Bayes":
+            return GaussianNB(**params)
+        elif algorithm == "QDA":
+            return QuadraticDiscriminantAnalysis(**params)
+        elif algorithm == 'Logistic Regression':
+            return LogisticRegression(**params, random_state=random_state)
+        elif algorithm == 'Linear Regression':
+            return LinearRegression(**params)
         else:
             raise ValueError(f"Unknown algorithm: {algorithm}")
+
+    def _get_base_estimator(self, estimator_name):
+        params = {k: v for k, v in self.config[estimator_name].items() if not k.startswith('#')}
+        if estimator_name == "Nearest Neighbors":
+            return KNeighborsClassifier(**params)
+        elif estimator_name == "Linear SVM":
+            return SVC(**params)
+        elif estimator_name == "Gaussian Process":
+            kernel_scale = params.pop('kernel_scale', 1.0)
+            return GaussianProcessClassifier(1.0 * RBF(kernel_scale), **params)
+        elif estimator_name == "Decision Tree":
+            return DecisionTreeClassifier(**params)
+        elif estimator_name == "Random Forest":
+            return RandomForestClassifier(**params)
+        elif estimator_name == "Neural Net":
+            return MLPClassifier(**params)
+        elif estimator_name == "Naive Bayes":
+            return GaussianNB(**params)
+        elif estimator_name == "QDA":
+            return QuadraticDiscriminantAnalysis(**params)
+        elif estimator_name == "Linear Regression":
+            return LinearRegression(**params)
+        else:
+            raise ValueError(f"Unknown base estimator: {estimator_name}")
 
 class DataProcessor:
     @staticmethod
@@ -101,7 +149,7 @@ class ModelTrainer:
         self.profit_history = []
         self.date_history = []
 
-    def train_and_predict(self, X, y, prices, dates, weeks, history, df, split_date, split_date_exit):
+    def train_and_predict(self, X, y, prices, dates, weeks, history, df, split_mode='second', max_hold_days=20):
         if len(X.shape) == 3:
             X = X.reshape(X.shape[0], -1)
         
@@ -109,6 +157,8 @@ class ModelTrainer:
             print("Empty input data. Skipping processing.")
             return None, None, None
 
+        split_date = '2015-01-05'
+        split_date_exit = '2020-01-02'
         predictions = []
         actual_values = []
         
@@ -127,14 +177,15 @@ class ModelTrainer:
             return None, None, None
         
         split_indices_exit = df[df['Data'] == split_date_exit].index
-        if len(split_indices_exit) == 0:
-            print(f"Split exit date {split_date_exit} not found in dataframe. Skipping processing.")
-            return None, None, None
-        
         print(split_indices_exit)
         split_point = split_index
-        split_point_exit = split_indices_exit[0] - history
-    
+        split_point_exit = split_indices_exit[0] -history
+       
+        try:
+            closing_price_col = get_close_matches('Kurs zamkniecia', df.columns, n=1, cutoff=0.6)[0]
+        except IndexError:
+            print("Could not find closing price column. Skipping processing.")
+            return None, None, None
         
         X_train_initial = X[:split_point]
         X_test = X[split_point:split_point_exit]
@@ -149,82 +200,94 @@ class ModelTrainer:
             
         X_train = X_train_initial.copy()
         y_train = y_train_initial.copy()
-        max_hold_days=weeks-1
+        
         days_holding = 0
         buy_index = -1
         wait = 3
         i=0
 
-        self.classifier.fit(X_train, y_train)
-                
-        for i in range(weeks-1):
-            X_current = X_test[i:i+1].copy()
-            warmup_pred = self.classifier.predict(X_current).astype(int)[0]
-            print(X_train[-1])
-            X_train = np.vstack([X_train, X_current])
-            y_train = np.append(y_train, warmup_pred)
-            print(X_current)
-            self.classifier.fit(X_train, y_train)
-    
         try:
-            for test_idx in range(weeks-1, len(X_test)):
-                data_idx = len(X_train_initial) + history + test_idx
+            for test_idx in range(len(X_test)):
+                self.classifier.fit(X_train, y_train)
+                
                 X_current = X_test[test_idx:test_idx+1].copy()
-              
-                 
-                print(X_train[-1])
-                print(X_current)
-                current_date = df["Data"].iloc[data_idx]
-                current_price = prices_test[test_idx-weeks+1]
-                current_price_open = df["Kurs otwarcia"].iloc[len(X_train_initial) + history + test_idx]
-
+                for _ in range(weeks-1):
+                    warmup_pred = self.classifier.predict(X_current).astype(int)[0]
+                    
+                    X_train = np.vstack([X_train, X_current])
+                    y_train = np.append(y_train, warmup_pred)
+                    if test_idx + 1 < len(X_test):
+                        X_current = X_test[test_idx+1:test_idx+2].copy()
+                        test_idx += 1
+                    else:
+                        break
                 if test_idx < len(X_test):
                     if self.NumberOfStocks > 0:
                         days_holding += 1
                     
                     final_pred = self.classifier.predict(X_test[test_idx:test_idx+1]).astype(int)[0]
                     
-                    if self.NumberOfStocks > 0 and days_holding >= max_hold_days:
-                        self.logger.log_transaction("sell (max hold)", X_train[-10:], 
-                                                None, current_price, current_date, None, None)
+                    data_idx = len(X_train_initial) + history + test_idx
+                    if data_idx >= len(df):
+                        print(f"Warning: Index {data_idx} out of bounds for DataFrame with length {len(df)}")
+                        continue
+                        
+                    current_date = df["Data"].iloc[data_idx]
+                    current_price = prices_test[test_idx-weeks] if test_idx-weeks >= 0 and test_idx-weeks < len(prices_test) else None
+                    
+                    if self.NumberOfStocks > 0 and days_holding >= max_hold_days and current_price is not None:
+                        sell_date_idx = len(X_train_initial) + history + test_idx - 1
+                        if sell_date_idx < 0 or sell_date_idx >= len(df):
+                            current_date = None
+                        else:
+                            current_date = df["Data"].iloc[sell_date_idx]
+                            
+                        self.logger.log_transaction("sell (max hold)", X_train[-10:] if len(X_train) > 10 else X_train, 
+                                                None, current_price, current_date)
                         self.NumberOfStocks, self.initial_capital = self.sell_stocks(current_price, self.NumberOfStocks, self.initial_capital)
                         days_holding = 0
-      
+                        buy_index = -1
                         
                         current_profit_pct = (self.initial_capital / self.logger.initial_capital_start - 1) * 100
                         self.profit_history.append(current_profit_pct)
-                        self.date_history.append(current_date)
+                        if current_date is not None:
+                            self.date_history.append(current_date)
                         wait = 1
                     
                     if final_pred == 1 and wait == 0:
-                        if current_price and self.NumberOfStocks == 0:
+                        if current_price is not None and current_date is not None and self.NumberOfStocks == 0:
                             predictions.append(final_pred)
                             actual_values.append(y_test[test_idx])
                             self.logger.update_predictions(final_pred, y_test[test_idx])
                             
+                            if "Kurs otwarcia" in df.columns:
+                                open_price_idx = len(X_train_initial) + history + test_idx
+                                if open_price_idx < len(df):
+                                    current_price = df["Kurs otwarcia"].iloc[open_price_idx]
                             
-                            self.NumberOfStocks, self.initial_capital = self.buy_stocks(current_price_open, self.initial_capital, self.NumberOfStocks)
+                            self.NumberOfStocks, self.initial_capital = self.buy_stocks(current_price, self.initial_capital, self.NumberOfStocks)
                             self.LastBuyPrice = current_price
-                            self.logger.log_transaction("buy", X_train[-10:], 
-                                                    X_test[test_idx:test_idx+1], current_price_open, current_date, split_date, split_date_exit)
+                            self.logger.log_transaction("buy", X_train[-10:] if len(X_train) > 11 else X_train, 
+                                                    X_test[test_idx], current_price, current_date)
                             
                             days_holding = 0
+                            buy_index = test_idx
+                            
                             current_profit_pct = ((self.initial_capital + (self.NumberOfStocks * current_price)) / self.logger.initial_capital_start - 1) * 100
                             self.profit_history.append(current_profit_pct)
                             self.date_history.append(current_date)
                     
                     wait = 0
                     
-                    X_train = np.vstack([X_train, X_current])
-                    y_train = np.append(y_train, final_pred)
-                    self.classifier.fit(X_train, y_train)   
+                    X_train = np.vstack([X_train, X_test[test_idx:test_idx+1]])
+                    y_train = np.append(y_train, y_test[test_idx])
                     
             if self.NumberOfStocks > 0 and prices_test is not None and len(prices_test) > 0:
                 last_price = current_price
                 last_date = current_date
                 
                 self.logger.log_transaction("sell (final)", X_train[-10:] if len(X_train) > 10 else X_train, 
-                                        None, last_price, last_date, None, None)
+                                        None, last_price, last_date)
                 self.NumberOfStocks, self.initial_capital = self.sell_stocks(last_price, self.NumberOfStocks, self.initial_capital)
                 self.logger.initial_capital_last_sell = self.initial_capital
                 
@@ -274,6 +337,55 @@ class ModelTrainer:
         NumberOfStocks = 0
         return NumberOfStocks, initial_capital
     
+    def train_model(self, X_train, y_train, ObiektXTest, X_test, weeks):
+        updated_X_train = X_train.copy()
+        updated_y_train = y_train.copy()
+        updated_ObiektXTest = ObiektXTest
+        
+        for _ in range(weeks-1):
+            X_current = X_test[updated_ObiektXTest:updated_ObiektXTest+1].copy()
+            warmup_pred = self.classifier.predict(X_current).astype(int)[0]
+            updated_X_train = np.vstack([updated_X_train, X_current])
+            updated_y_train = np.append(updated_y_train, warmup_pred)
+            self.classifier.fit(updated_X_train, updated_y_train)
+            updated_ObiektXTest += 1
+        
+        self.classifier.fit(updated_X_train, updated_y_train)
+        
+        return updated_X_train, updated_y_train, updated_ObiektXTest
+
+    def move_a_day(self, X_current, X_train, y_train, X_test, ObiektXTest):
+        updated_X_train = X_train.copy()
+        updated_y_train = y_train.copy()
+        updated_ObiektXTest = ObiektXTest
+        
+        updated_X_current = X_test[updated_ObiektXTest:updated_ObiektXTest+1].copy()
+        warmup_pred = self.classifier.predict(updated_X_current).astype(int)[0]
+        updated_X_train = np.vstack([updated_X_train, updated_X_current])
+        updated_y_train = np.append(updated_y_train, warmup_pred)
+        updated_ObiektXTest += 1
+        
+        self.classifier.fit(updated_X_train, updated_y_train)
+        
+        return updated_X_current, updated_X_train, updated_y_train, updated_ObiektXTest
+
+    def make_prediction(self, X_test, predictions, actual_values, y_test, ObiektXTest, pred):
+        updated_predictions = predictions.copy()
+        updated_actual_values = actual_values.copy()
+        
+        updated_pred = self.classifier.predict(X_test[ObiektXTest:ObiektXTest+1]).astype(int)[0]
+        self.logger.update_predictions(updated_pred, y_test[ObiektXTest])
+        if updated_pred==1:
+            updated_predictions.append(updated_pred)
+            updated_actual_values.append(y_test[ObiektXTest])
+        
+        return updated_predictions, updated_actual_values, updated_pred
+
+from datetime import datetime
+import time
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+
 class TradeLogger:
     def __init__(self, output_file, graph_file):
         self.output_file = output_file
@@ -302,13 +414,13 @@ class TradeLogger:
         self.start_date_obj = None
         self.end_date_obj = None
         self.df = None  
-        self.start_index = None  
+        self.start_index = None 
         self.end_index = None    
 
     def set_dataframe(self, df):
         self.df = df
 
-    def log_transaction(self, transaction_type, X_train_last10, X_test_current, current_price, current_date, split_date, split_date_exit):
+    def log_transaction(self, transaction_type, X_train_last10, X_test_current, current_price, current_date):
         if transaction_type == "buy":
             self.last_buy_iteration = self.iteration_count
             self.transaction_count += 1
@@ -318,22 +430,23 @@ class TradeLogger:
             self.last_buy_iteration = None
 
         if self.start_date is None:
-            self.start_date = split_date
-            self.start_date_obj = self._parse_date(split_date)
+            self.start_date = current_date
+            self.start_date_obj = self._parse_date(current_date)
+           
             if self.df is not None and "Data" in self.df.columns:
                 try:
-                    matching_indices = self.df[self.df["Data"] == split_date].index
+                    matching_indices = self.df[self.df["Data"] == current_date].index
                     if not matching_indices.empty:
                         self.start_index = matching_indices[0]
                 except Exception as e:
                     print(f"Error finding start date index: {e}")
-        if self.end_date is None:
-            self.end_date = split_date_exit
-            self.end_date_obj = self._parse_date(split_date_exit)
+        
+        self.end_date = current_date
+        self.end_date_obj = self._parse_date(current_date)
 
         if self.df is not None and "Data" in self.df.columns:
             try:
-                matching_indices = self.df[self.df["Data"] == split_date_exit].index
+                matching_indices = self.df[self.df["Data"] == current_date].index
                 if not matching_indices.empty:
                     self.end_index = matching_indices[0]
             except Exception as e:
@@ -381,12 +494,13 @@ class TradeLogger:
     
     def finalize(self):
         self.end_time = time.time()
-    
+        
         if self.df is not None and "Data" in self.df.columns and not self.df.empty:
             last_date = self.df["Data"].iloc[-1]
             if last_date is not None:
                 self.end_date = last_date
                 self.end_date_obj = self._parse_date(last_date) if isinstance(last_date, str) else last_date
+
                 try:
                     matching_indices = self.df[self.df["Data"] == last_date].index
                     if not matching_indices.empty:
@@ -396,7 +510,9 @@ class TradeLogger:
         
         self.create_profit_chart()
     
+
     def create_profit_chart(self):
+
         if not self.profit_history:
             print("No profit history data available to create chart. Creating an empty chart instead.")
             fig, ax = plt.figure(figsize=(12, 6)), plt.subplot(111)
@@ -444,6 +560,7 @@ class TradeLogger:
         fig, ax = plt.figure(figsize=(12, 6)), plt.subplot(111)
         
         try:
+    
             ax.plot(dates, valid_profits, 'b-', linewidth=2, marker='o', markersize=4)
             
             ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
@@ -490,6 +607,7 @@ class TradeLogger:
         if self.df is not None and "Data" in self.df.columns and not self.df.empty:
             self.end_date = self.df["Data"].iloc[-1143]
             self.end_date_obj = self._parse_date(self.end_date) if isinstance(self.end_date, str) else self.end_date
+          
             try:
                 matching_indices = self.df[self.df["Data"] == self.end_date].index
                 if not matching_indices.empty:
@@ -530,6 +648,8 @@ class TradeLogger:
                 f.write(f"Profit: {profit:.2f}\n")
                 if self.initial_capital_start > 0:
                     f.write(f"Profit procentowy: {(profit/self.initial_capital_start*100):.2f}%\n")
+                    
+                  
             else:
                 f.write("Kapital na koncu dzialania: Brak danych\n")
                 f.write("Profit: Brak danych\n")
@@ -548,7 +668,7 @@ class TradeLogger:
                     f.write(f"\nTransakcja {i} ({transaction['type'].upper()}):\n")
                     f.write(f"Data transakcji z pliku: {transaction['date']}\n")
                     f.write(f"Obecna cena: {transaction['current_price']}\n")
-                    
+                
                     if transaction['type'] == "buy":
                         price = transaction['current_price']
                         stocks_bought = current_capital // price
@@ -570,7 +690,7 @@ class TradeLogger:
                     elif transaction['type'].startswith("sell"):
                         price = transaction['current_price']
                         sell_value = current_stocks * price
-                        sell_fee = sell_value * 0.0039 
+                        sell_fee = sell_value * 0.0039  
                         net_proceeds = sell_value - sell_fee
                         
                         current_capital += net_proceeds
@@ -637,7 +757,7 @@ class TradingSummary:
                     if initial_capital_match and final_capital_match:
                         initial = float(initial_capital_match.group(1))
                         final = float(final_capital_match.group(1))
-                        
+                    
                         iterations = index_diff if index_diff > 0 else (int(iterations_match.group(1)) if iterations_match else 0)
                         
                         profit = final - initial
@@ -725,10 +845,11 @@ class TradingSummary:
             
             companies = [stat['company'] for stat in sorted_stats]
             percent_returns = [stat['percent_return'] for stat in sorted_stats]
-        
+            
             plt.figure(figsize=(12, 8))
             
             bars = plt.barh(companies, percent_returns)
+            
             for i, bar in enumerate(bars):
                 if percent_returns[i] >= 0:
                     bar.set_color('green')
@@ -738,7 +859,7 @@ class TradingSummary:
             plt.title('Profit Comparison by Company')
             plt.xlabel('Profit (%)')
             plt.grid(axis='x', alpha=0.3)
-        
+            
             for i, v in enumerate(percent_returns):
                 plt.text(v + (1 if v >= 0 else -5), i, f"{v:.1f}%", 
                          va='center', fontweight='bold')
@@ -753,7 +874,7 @@ class TradingSummary:
 
 def main():
     config_reader = ConfigReader('configAl.json')
-    weeks, features, history, random_state, algorithm, initial_capital, split_date, split_date_exit, config = config_reader.get_parameters()  
+    weeks, features, _, history, random_state, algorithm, initial_capital, _, config = config_reader.get_parameters()  
     
     classifier_factory = ClassifierFactory(config)
     classifier = classifier_factory.get_classifier()
@@ -764,6 +885,8 @@ def main():
     
     os.makedirs(results_directory, exist_ok=True)
     os.makedirs(graphs_directory, exist_ok=True)
+    
+    split_date = '2015-01-05'  
 
     for filename in os.listdir(data_directory):
         if filename.endswith('.xlsx') or filename.endswith('.xls'):
@@ -786,7 +909,7 @@ def main():
                 graph_file = os.path.join(graphs_directory, f"Profit_Graph_{base_name}_{history}_{weeks}.png")
                 
                 logger = TradeLogger(output_file, graph_file)
-            
+                
                 logger.set_dataframe(df)
                 
                 X, y, dates, prices = DataProcessor.prepare_data(df, weeks, features, history=history)
@@ -801,16 +924,9 @@ def main():
                     x_test_normal_size=len(X)-split_point,
                     total_x_size=len(X)
                 )
-                
+                    
                 model_trainer = ModelTrainer(classifier, random_state, logger, initial_capital)
-                train_results = model_trainer.train_and_predict(
-                    X, y, prices, dates, 
-                    weeks=weeks, 
-                    history=history, 
-                    df=df, 
-                    split_date=split_date,
-                    split_date_exit=split_date_exit
-                )
+                train_results = model_trainer.train_and_predict(X, y, prices, dates, weeks=weeks, history=history, df=df)
                 
                 if train_results is None or len(train_results) != 3:
                     print(f"Skipping processing for {excel_file} - training failed")
@@ -829,6 +945,7 @@ def main():
     print("\nGenerating trading summary...")
     summary = TradingSummary(results_directory)
     summary.process_results()
+    
     summary_file = os.path.join(results_directory, 'trading_summary.txt')
     summary.write_summary(summary_file)
     print(f"Summary saved in: {summary_file}")
